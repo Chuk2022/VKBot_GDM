@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  diabetes-bot:
+    build: .
+    container_name: vk-diabetes-bot
+    restart: always
+    environment:
+      - VK_GROUP_TOKEN=${VK_GROUP_TOKEN}
+    volumes:
+      - ./data:/app/data  # Сохраняем базу данных на хосте
+      - ./logs:/app/logs  # Сохраняем логи на хосте
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
