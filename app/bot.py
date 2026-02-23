@@ -1,18 +1,23 @@
 from vkbottle.bot import Bot, Message
 from vkbottle import Keyboard, KeyboardButtonColor, Text
-from database import Session, User, GlucoseReading
-from config import VK_GROUP_TOKEN, ADMIN_IDS
+from vkbottle import PhotoMessageUploader
+from sqlalchemy import func, and_
 import logging
-from datetime import datetime
-import traceback
+from datetime import datetime, timedelta
 import io
 import matplotlib
+import numpy as np
+import os
+import sys
+
+# Добавляем путь к проекту
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+from database import Session, User, GlucoseReading
+from config import VK_GROUP_TOKEN, ADMIN_IDS
 
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import numpy as np
-from vkbottle import PhotoMessageUploader
-from sqlalchemy import func
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,58 +49,161 @@ def create_main_keyboard():
     # Третий ряд
     keyboard.add(Text("⏱ Через час после еды"), color=KeyboardButtonColor.POSITIVE)
     keyboard.add(Text("📊 График"), color=KeyboardButtonColor.SECONDARY)
+    keyboard.add(Text("📊 Моя статистика"), color=KeyboardButtonColor.SECONDARY)
+    keyboard.row()
+    keyboard.add(Text("📅 За неделю"), color=KeyboardButtonColor.PRIMARY)
+    keyboard.add(Text("📅 За месяц"), color=KeyboardButtonColor.PRIMARY)
 
     return keyboard
 
 
+def create_admin_keyboard():
+    """Клавиатура для администратора"""
+    keyboard = create_main_keyboard()
+    keyboard.row()
+    keyboard.add(Text("👥 Список клиентов"), color=KeyboardButtonColor.PRIMARY)
+    keyboard.add(Text("📊 Админ панель"), color=KeyboardButtonColor.SECONDARY)
+    return keyboard
+
+
 # ============= ФУНКЦИИ ДЛЯ РАБОТЫ С ПОЛЬЗОВАТЕЛЯМИ =============
-async def get_or_create_user(vk_id: int, name: str = None):
+def get_or_create_user(vk_id: int, name: str = None):
     """Получить или создать пользователя в базе"""
-    session = None
+    session = Session()
     try:
-        session = Session()
         user = session.query(User).filter_by(vk_id=vk_id).first()
 
         if not user:
-            if not name:
-                try:
-                    user_info = await bot.api.users.get(vk_id)
-                    if user_info and len(user_info) > 0:
-                        name = f"{user_info[0].first_name} {user_info[0].last_name}"
-                    else:
-                        name = f"User_{vk_id}"
-                except:
-                    name = f"User_{vk_id}"
-
+            # Проверяем, является ли пользователь администратором
             is_admin = vk_id in ADMIN_IDS
-            user = User(vk_id=vk_id, name=name, is_admin=is_admin)
+            user = User(
+                vk_id=vk_id,
+                name=name or f"User_{vk_id}",
+                is_admin=is_admin
+            )
             session.add(user)
             session.commit()
-            logger.info(f"Создан новый пользователь: {name} (admin={is_admin})")
+            logger.info(f"Создан новый пользователь: {user.name} (admin={is_admin})")
 
         return user
     except Exception as e:
+        session.rollback()
         logger.error(f"Ошибка в get_or_create_user: {e}")
-        return User(vk_id=vk_id, name=name or f"User_{vk_id}", is_admin=vk_id in ADMIN_IDS)
+        raise
     finally:
-        if session:
-            session.close()
+        session.close()
 
 
 def is_admin(vk_id: int) -> bool:
     """Проверка, является ли пользователь администратором"""
     session = Session()
-    user = session.query(User).filter_by(vk_id=vk_id).first()
-    session.close()
-    return user and user.is_admin
+    try:
+        user = session.query(User).filter_by(vk_id=vk_id).first()
+        return user and user.is_admin
+    finally:
+        session.close()
 
 
 def get_all_users():
     """Получить список всех пользователей (кроме администраторов)"""
     session = Session()
-    users = session.query(User).filter_by(is_admin=False).order_by(User.name).all()
-    session.close()
-    return users
+    try:
+        users = session.query(User).filter_by(is_admin=False).order_by(User.name).all()
+        return users
+    finally:
+        session.close()
+
+
+def get_user_readings(user_id: int, days: int = None):
+    """
+    Получить показания пользователя
+    :param user_id: ID пользователя
+    :param days: количество дней (None = все дни)
+    """
+    session = Session()
+    try:
+        query = session.query(GlucoseReading).filter_by(user_id=user_id)
+
+        if days is not None:
+            cutoff_date = datetime.now() - timedelta(days=days)
+            query = query.filter(GlucoseReading.timestamp >= cutoff_date)
+
+        return query.order_by(GlucoseReading.timestamp).all()
+    finally:
+        session.close()
+
+
+def get_user_statistics(user_id: int):
+    """Получить полную статистику пользователя за всё время"""
+    session = Session()
+    try:
+        readings = session.query(GlucoseReading).filter_by(user_id=user_id).all()
+
+        if not readings:
+            return {
+                'total': 0,
+                'avg': 0,
+                'min': 0,
+                'max': 0,
+                'by_period': {},
+                'first_date': None,
+                'last_date': None
+            }
+
+        values = [r.value for r in readings]
+
+        # Статистика по периодам
+        periods = {}
+        for reading in readings:
+            if reading.period not in periods:
+                periods[reading.period] = []
+            periods[reading.period].append(reading.value)
+
+        period_stats = {}
+        for period, vals in periods.items():
+            period_stats[period] = {
+                'count': len(vals),
+                'avg': sum(vals) / len(vals),
+                'min': min(vals),
+                'max': max(vals)
+            }
+
+        return {
+            'total': len(readings),
+            'avg': sum(values) / len(values),
+            'min': min(values),
+            'max': max(values),
+            'by_period': period_stats,
+            'first_date': min(r.timestamp for r in readings),
+            'last_date': max(r.timestamp for r in readings)
+        }
+    finally:
+        session.close()
+
+
+def save_glucose_reading(user_id: int, value: float, period: str):
+    """Сохранить показание глюкозы"""
+    session = Session()
+    try:
+        reading = GlucoseReading(
+            user_id=user_id,
+            value=value,
+            period=period,
+            timestamp=datetime.now()
+        )
+        session.add(reading)
+        session.commit()
+        logger.info(f"Сохранено показание: {value} для пользователя {user_id}")
+
+        # Получаем общее количество записей пользователя
+        total = session.query(GlucoseReading).filter_by(user_id=user_id).count()
+        return reading, total
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Ошибка сохранения: {e}")
+        raise
+    finally:
+        session.close()
 
 
 # ============= ОБРАБОТЧИКИ КОМАНД =============
@@ -103,27 +211,21 @@ def get_all_users():
 async def start_handler(message: Message):
     """Обработчик команды старт"""
     try:
-        user_name = None
-        try:
-            user_info = await bot.api.users.get(message.from_id)
-            if user_info and len(user_info) > 0:
-                user_name = f"{user_info[0].first_name} {user_info[0].last_name}"
-        except Exception as e:
-            logger.warning(f"Не удалось получить имя: {e}")
+        # Получаем имя пользователя из VK
+        user_info = await bot.api.users.get(message.from_id)
+        user_name = f"{user_info[0].first_name} {user_info[0].last_name}" if user_info else f"User_{message.from_id}"
 
-        user = await get_or_create_user(message.from_id, user_name)
+        user = get_or_create_user(message.from_id, user_name)
         logger.info(f"Пользователь {user.name} запустил бота")
 
-        keyboard = create_main_keyboard()
+        # Выбираем клавиатуру
+        keyboard = create_admin_keyboard() if user.is_admin else create_main_keyboard()
 
-        if user.is_admin:
-            keyboard.row()
-            keyboard.add(Text("👥 Список клиентов"), color=KeyboardButtonColor.PRIMARY)
-            keyboard.add(Text("📊 Админ панель"), color=KeyboardButtonColor.SECONDARY)
-
+        # Приветственное сообщение
         await message.answer(
             f"👋 Здравствуйте, {user.name}!\n"
-            "Выберите период измерения:",
+            f"📊 Всего записей: {session.query(GlucoseReading).filter_by(user_id=message.from_id).count()}\n\n"
+            f"Выберите период измерения:",
             keyboard=keyboard.get_json()
         )
     except Exception as e:
@@ -150,9 +252,118 @@ async def measurement_time_handler(message: Message):
     period_text = message.text.split(' ', 1)[1] if ' ' in message.text else message.text
 
     await message.answer(
-        f"📝 Введите показатель глюкозы для периода: *{period_text}*",
+        f"📝 Введите показатель глюкозы для периода: *{period_text}*\n"
+        f"(число от 1.0 до 30.0, например: 5.6)",
         keyboard=create_main_keyboard().get_json()
     )
+
+
+@bot.on.message(text=["📊 График"])
+async def plot_handler(message: Message):
+    """График за всё время"""
+    await message.answer("⏳ Генерирую график за всё время...")
+
+    try:
+        readings = get_user_readings(message.from_id, days=None)
+
+        if len(readings) < 2:
+            await message.answer(
+                "📭 Недостаточно данных. Нужно минимум 2 замера.",
+                keyboard=create_main_keyboard().get_json()
+            )
+            return
+
+        await generate_and_send_plot(message, readings, message.from_id)
+
+    except Exception as e:
+        logger.error(f"Ошибка в plot_handler: {e}")
+        await message.answer(
+            f"❌ Ошибка при создании графика",
+            keyboard=create_main_keyboard().get_json()
+        )
+
+
+@bot.on.message(text=["📅 За неделю"])
+async def week_plot_handler(message: Message):
+    """График за последнюю неделю"""
+    await message.answer("⏳ Генерирую график за последнюю неделю...")
+
+    try:
+        readings = get_user_readings(message.from_id, days=7)
+
+        if len(readings) < 2:
+            await message.answer(
+                "📭 Недостаточно данных за последнюю неделю",
+                keyboard=create_main_keyboard().get_json()
+            )
+            return
+
+        await generate_and_send_plot(message, readings, message.from_id, "за последнюю неделю")
+
+    except Exception as e:
+        logger.error(f"Ошибка в week_plot_handler: {e}")
+        await message.answer(
+            f"❌ Ошибка при создании графика",
+            keyboard=create_main_keyboard().get_json()
+        )
+
+
+@bot.on.message(text=["📅 За месяц"])
+async def month_plot_handler(message: Message):
+    """График за последний месяц"""
+    await message.answer("⏳ Генерирую график за последний месяц...")
+
+    try:
+        readings = get_user_readings(message.from_id, days=30)
+
+        if len(readings) < 2:
+            await message.answer(
+                "📭 Недостаточно данных за последний месяц",
+                keyboard=create_main_keyboard().get_json()
+            )
+            return
+
+        await generate_and_send_plot(message, readings, message.from_id, "за последний месяц")
+
+    except Exception as e:
+        logger.error(f"Ошибка в month_plot_handler: {e}")
+        await message.answer(
+            f"❌ Ошибка при создании графика",
+            keyboard=create_main_keyboard().get_json()
+        )
+
+
+@bot.on.message(text=["📊 Моя статистика"])
+async def my_stats_handler(message: Message):
+    """Показать статистику пользователя"""
+    stats = get_user_statistics(message.from_id)
+
+    if stats['total'] == 0:
+        await message.answer(
+            "📭 У вас пока нет записей",
+            keyboard=create_main_keyboard().get_json()
+        )
+        return
+
+    # Формируем сообщение со статистикой
+    text = f"📊 **ВАША СТАТИСТИКА**\n\n"
+    text += f"📈 Всего записей: {stats['total']}\n"
+    text += f"📉 Среднее: {stats['avg']:.1f} ммоль/л\n"
+    text += f"⬇️ Мин: {stats['min']:.1f}\n"
+    text += f"⬆️ Макс: {stats['max']:.1f}\n"
+
+    if stats['first_date']:
+        text += f"📅 Первая запись: {stats['first_date'].strftime('%d.%m.%Y')}\n"
+        text += f"📅 Последняя: {stats['last_date'].strftime('%d.%m.%Y')}\n\n"
+
+    text += f"📊 **По периодам:**\n"
+    for period, pstats in stats['by_period'].items():
+        text += f"• {period}: {pstats['count']} зап., "
+        text += f"ср. {pstats['avg']:.1f} "
+        text += f"({pstats['min']:.1f}-{pstats['max']:.1f})\n"
+
+    keyboard = create_admin_keyboard() if is_admin(message.from_id) else create_main_keyboard()
+    await message.answer(text, keyboard=keyboard.get_json())
 
 
 # ============= АДМИНИСТРАТИВНЫЕ ОБРАБОТЧИКИ =============
@@ -239,43 +450,16 @@ async def overall_stats_handler(message: Message):
             stats_text += f"   Среднее: {np.mean(values):.1f}\n\n"
 
     session.close()
-    await message.answer(stats_text, keyboard=create_main_keyboard().get_json())
+
+    keyboard = create_admin_keyboard()
+    await message.answer(stats_text, keyboard=keyboard.get_json())
 
 
 @bot.on.message(text=["🔙 Назад"])
 async def back_handler(message: Message):
     """Вернуться в главное меню"""
-    keyboard = create_main_keyboard()
-
-    if is_admin(message.from_id):
-        keyboard.row()
-        keyboard.add(Text("👥 Список клиентов"), color=KeyboardButtonColor.PRIMARY)
-        keyboard.add(Text("📊 Админ панель"), color=KeyboardButtonColor.SECONDARY)
-
+    keyboard = create_admin_keyboard() if is_admin(message.from_id) else create_main_keyboard()
     await message.answer("Главное меню:", keyboard=keyboard.get_json())
-
-
-# ============= ОБРАБОТЧИК ГРАФИКА (ДЛЯ СЕБЯ) =============
-@bot.on.message(text=["📊 График"])
-async def plot_handler(message: Message):
-    """График для самого пользователя"""
-    await message.answer("⏳ Генерирую график...")
-
-    try:
-        session = Session()
-        readings = session.query(GlucoseReading).filter_by(user_id=message.from_id).all()
-        session.close()
-
-        if len(readings) < 2:
-            await message.answer("📭 Недостаточно данных")
-            return
-
-        # Здесь код генерации графика (можно вынести в отдельную функцию)
-        await generate_and_send_plot(message, readings, message.from_id)
-
-    except Exception as e:
-        logger.error(f"Ошибка: {e}")
-        await message.answer(f"❌ Ошибка")
 
 
 # ============= УНИВЕРСАЛЬНЫЙ ОБРАБОТЧИК =============
@@ -284,9 +468,27 @@ async def universal_handler(message: Message):
     """Единый универсальный обработчик"""
     logger.info(f"Универсальный обработчик: '{message.text}'")
 
-    # СЛУЧАЙ 1: Мы ждем ввод глюкозы
+    # СЛУЧАЙ 1: Обработка кнопок меню
+    if message.text == "📊 Моя статистика":
+        await my_stats_handler(message)
+        return
+
+    if message.text == "📊 График":
+        await plot_handler(message)
+        return
+
+    if message.text == "📅 За неделю":
+        await week_plot_handler(message)
+        return
+
+    if message.text == "📅 За месяц":
+        await month_plot_handler(message)
+        return
+
+    # СЛУЧАЙ 2: Мы ждем ввод глюкозы
     if message.from_id in user_states and user_states[message.from_id].get('waiting_for_value'):
         try:
+            # Заменяем запятую на точку для корректного преобразования
             value = float(message.text.replace(',', '.'))
 
             if value < 1.0 or value > 30.0:
@@ -296,34 +498,26 @@ async def universal_handler(message: Message):
             period = user_states[message.from_id]['period']
             clean_period = period.split(' ', 1)[1] if ' ' in period else period
 
-            session = Session()
-            reading = GlucoseReading(
-                user_id=message.from_id,
-                value=value,
-                period=clean_period,
-                timestamp=datetime.now()
-            )
-            session.add(reading)
-            session.commit()
-
-            total_readings = session.query(GlucoseReading).filter_by(user_id=message.from_id).count()
-            session.close()
+            # Сохраняем в базу
+            reading, total = save_glucose_reading(message.from_id, value, clean_period)
 
             del user_states[message.from_id]
+
+            keyboard = create_admin_keyboard() if is_admin(message.from_id) else create_main_keyboard()
 
             await message.answer(
                 f"✅ Сохранено: {value} ммоль/л\n"
                 f"Период: {clean_period}\n"
-                f"Всего записей: {total_readings}",
-                keyboard=create_main_keyboard().get_json()
+                f"Всего записей: {total}",
+                keyboard=keyboard.get_json()
             )
             return
 
         except ValueError:
-            await message.answer("❌ Введите число (пример: 5,6)")
+            await message.answer("❌ Введите число (пример: 5,6 или 5.6)")
             return
 
-    # СЛУЧАЙ 2: Админ выбирает клиента (сообщение начинается с цифр и содержит двоеточие)
+    # СЛУЧАЙ 3: Админ выбирает клиента (сообщение начинается с цифр и содержит двоеточие)
     if (is_admin(message.from_id) and
             message.text and
             message.text[0].isdigit() and
@@ -352,22 +546,24 @@ async def universal_handler(message: Message):
         except Exception as e:
             logger.error(f"Ошибка выбора клиента: {e}")
 
-    # СЛУЧАЙ 3: Всё остальное - неизвестная команда
+    # СЛУЧАЙ 4: Всё остальное - неизвестная команда
+    keyboard = create_admin_keyboard() if is_admin(message.from_id) else create_main_keyboard()
     await message.answer(
         "❓ Используйте кнопки меню",
-        keyboard=create_main_keyboard().get_json()
+        keyboard=keyboard.get_json()
     )
 
 
 # ============= ФУНКЦИЯ ДЛЯ ГЕНЕРАЦИИ ГРАФИКА =============
-async def generate_and_send_plot(message: Message, readings: list, user_id: int, user_name: str = None):
+async def generate_and_send_plot(message: Message, readings: list, user_id: int, period_text: str = "за всё время"):
     """Универсальная функция для создания и отправки графика"""
     try:
-        if not user_name:
-            session = Session()
-            user = session.query(User).filter_by(vk_id=user_id).first()
-            user_name = user.name if user else f"User_{user_id}"
-            session.close()
+        session = Session()
+        user = session.query(User).filter_by(vk_id=user_id).first()
+        user_name = user.name if user else f"User_{user_id}"
+        session.close()
+
+        logger.info(f"Создание графика для {user_name}, записей: {len(readings)}")
 
         fig, ax = plt.subplots(figsize=(14, 8))
 
@@ -406,7 +602,8 @@ async def generate_and_send_plot(message: Message, readings: list, user_id: int,
         ax.set_xticks(x_positions)
         ax.set_xticklabels(all_periods, rotation=45, ha='right', fontsize=11)
         ax.set_ylabel('Глюкоза (ммоль/л)', fontsize=12)
-        ax.set_title(f'График глюкозы: {user_name}', fontsize=16, fontweight='bold')
+        ax.set_title(f'График глюкозы: {user_name} ({period_text})',
+                     fontsize=16, fontweight='bold')
         ax.grid(True, alpha=0.3, linestyle='--', axis='y')
         ax.legend(loc='upper right')
 
@@ -433,10 +630,11 @@ async def generate_and_send_plot(message: Message, readings: list, user_id: int,
             peer_id=message.peer_id
         )
 
+        keyboard = create_admin_keyboard() if is_admin(message.from_id) else create_main_keyboard()
         await message.answer(
-            f"📊 График:",
+            f"📊 График {period_text}:",
             attachment=photo,
-            keyboard=create_main_keyboard().get_json()
+            keyboard=keyboard.get_json()
         )
 
     except Exception as e:
@@ -445,5 +643,8 @@ async def generate_and_send_plot(message: Message, readings: list, user_id: int,
 
 
 if __name__ == "__main__":
-    logger.info("Запуск бота...")
+    logger.info("=" * 50)
+    logger.info("🚀 ЗАПУСК БОТА ДЛЯ КОНТРОЛЯ ГЛЮКОЗЫ")
+    logger.info(f"📁 База данных: {os.path.abspath('data/glucose.db')}")
+    logger.info("=" * 50)
     bot.run_forever()
