@@ -56,8 +56,8 @@ diabetes-bot/
 
 1. **Клонируйте репозиторий:**
 ```bash
-git clone https://github.com/your-username/diabetes-bot.git
-cd diabetes-bot
+git clone https://github.com/Chuk2022/VKBot_GDM.git
+cd VKBot_GDM/app
 ```
 
 2. **Создайте виртуальное окружение:**
@@ -165,8 +165,8 @@ ADMIN_IDS=ваш_id_здесь
 
 ### Установка для разработки
 ```bash
-git clone https://github.com/your-username/diabetes-bot.git
-cd diabetes-bot
+git clone https://github.com/Chuk2022/VKBot_GDM.git
+cd VKBot_GDM/app
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
@@ -208,8 +208,8 @@ MIT License. Подробнее в файле [LICENSE](LICENSE).
 ## 📞 Контакты
 
 По вопросам и предложениям:
-- Создайте [issue](https://github.com/your-username/diabetes-bot/issues)
-- Напишите в Telegram: [@username](https://t.me/username)
+- Создайте [issue](https://github.com/Chuk2022/VKBot_GDM/issues)
+- Напишите в Telegram: [@username](https://t.me/sergeychernuha)
 
 ---
 ⭐ Если проект оказался полезным, поставьте звезду на GitHub!
